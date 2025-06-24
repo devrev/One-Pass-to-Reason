@@ -1,0 +1,742 @@
+diff --git a/src/llamafactory/data/collator.py b/src/llamafactory/data/collator.py
+index 3fb08f4b..30efb2b9 100644
+--- a/src/llamafactory/data/collator.py
++++ b/src/llamafactory/data/collator.py
+@@ -25,7 +25,7 @@ from transformers import DataCollatorForSeq2Seq
+ 
+ from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
+ from ..extras.packages import is_pillow_available
+-
++from ..extras.misc import get_current_device
+ 
+ if is_pillow_available():
+     from PIL import Image
+@@ -37,6 +37,115 @@ if TYPE_CHECKING:
+     from .template import Template
+ 
+ 
++def get_turn_ids(role_ids: "torch.Tensor") -> "torch.Tensor":
++    r"""Get turn ids from role ids.
++
++    Args:
++        role_ids: Tensor of shape (batch_size, seq_len) with values 0, 1, 2, or 3
++
++    Returns:
++        Tensor of shape (batch_size, seq_len) with turn ids.
++    """
++    # Pre-allocate output with correct type.
++    turn_ids = torch.zeros_like(role_ids)
++
++    # This shifts role_ids to the right by 1 position.
++    shifted_roles = torch.roll(role_ids, shifts=1, dims=1)
++
++    # Zero out the first position of shifted_roles (which wrapped around).
++    shifted_roles[:, 0] = 0
++
++    # Fuse operations to detect turn changes.
++    non_padding = (role_ids != 0)
++    turn_increment_mask = non_padding & (role_ids == 1) & (shifted_roles != 1)
++
++    # Compute turns with cumulative sum.
++    torch.cumsum(turn_increment_mask, dim=1, out=turn_ids)
++
++    # Zero out padding positions.
++    turn_ids.masked_fill_(~non_padding, 0)
++    return turn_ids
++
++def causal_non_padding_mask(role_ids: "torch.Tensor") -> "torch.Tensor":
++    r"""Create a causal non-padding mask.
++    """
++    bsz, seq_len = role_ids.size()
++    i = torch.arange(seq_len, device=role_ids.device)
++    non_pad = (role_ids != 0) # non-padding mask [bsz, seq_len]
++    return (
++        (i[None, :, None] >= i[None, None, :]) # causal [1, seq_len, seq_len]
++        & non_pad[:, :, None] # [bsz, seq_len, 1]
++        & non_pad[:, None, :] # [bsz, 1, seq_len]
++    )
++
++def prepare_conversational_reasoning_4d_attention_mask(role_ids: "torch.Tensor", dtype: "torch.dtype", indices: Optional["torch.Tensor"] = None) -> "torch.Tensor":
++    r"""Expand 2d attention mask to 4d attention mask for conversational reasoning.
++    TODO: improve the documentation explaining the mask.
++
++    Handles 4 types of token indices:
++    - 1: human messages
++    - 2: thinking messages
++    - 3: first assistant response
++    - 4: second assistant response (duplicated)
++    - 0: padding
++
++    Creates a specific attention pattern where:
++    - Human can attend to: self, previous human, previous first assistant
++    - Thinking can attend to: self, previous human, previous first assistant
++    - First assistant can attend to: self, previous human, previous first assistant
++    - Second assistant can attend to: self, previous human, previous first assistant,
++      preceding thinking tokens only
++
++    Args:
++        attention_mask_with_indices: Tensor of shape (batch_size, seq_len) with values 0, 1, 2, or 3
++        dtype: Dtype for the output attention mask
++
++    Returns:
++        4D attention mask of shape (batch_size, 1, seq_len, seq_len)
++    """
++    bsz, seq_len = role_ids.size()
++
++    # Move to compute device if the source is CPU.
++    source_device = role_ids.device
++    compute_device = get_current_device() if source_device.type == "cpu" else source_device
++    if compute_device != source_device:
++        role_ids = role_ids.to(compute_device)
++        if indices is not None:
++            indices = indices.to(compute_device)
++
++    min_dtype = torch.finfo(dtype).min
++    zero_tensor = torch.tensor(0, dtype=dtype, device=compute_device)
++
++    # Initialize final_mask as causal non-padding mask.
++    final_mask = causal_non_padding_mask(role_ids) # [bsz, seq_len, seq_len]
++
++    turn_ids = get_turn_ids(role_ids) # [bsz, seq_len]
++    # Calculate turn equality mask.
++    turn_ii = (turn_ids[:, :, None] == turn_ids[:, None, :]) # [bsz, seq_len, seq_len]
++
++    role_i = role_ids.unsqueeze(2)  # [bsz, seq_len, 1]
++    role_j = role_ids.unsqueeze(1)  # [bsz, 1, seq_len]
++
++    # compute required masks.
++    human_j, think_j, input_j, output_j = (role_j == 1), (role_j == 2), (role_j == 3), (role_j == 4)
++    ninput_i, noutput_i = (role_i != 3), (role_i != 4)
++
++    final_mask.logical_and_((human_j)|(output_j & turn_ii)|(input_j & noutput_i)|(input_j & ~turn_ii)|(think_j & turn_ii & ninput_i))
++
++    if indices is not None:
++        # disable cross attention between different indices.
++        final_mask.logical_and_(indices[:, None, :] == indices[:, :, None])
++
++    final_mask = final_mask.unsqueeze(1) # bsz, 1, seq_len, seq_len
++    # Invert the final_mask.
++    attention_mask_4d = torch.where(final_mask, zero_tensor, min_dtype)
++
++    # Move back to original device if needed.
++    if compute_device != source_device:
++        attention_mask_4d = attention_mask_4d.to(source_device)
++    return attention_mask_4d
++
++
+ def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype: "torch.dtype") -> "torch.Tensor":
+     r"""Expand 2d attention mask to 4d attention mask.
+ 
+@@ -225,10 +334,15 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
+     block_diag_attn: bool = False
+     attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "eager"
+     compute_dtype: "torch.dtype" = torch.float32
++    conversational_reasoning_attn: bool = False
+ 
+     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
+         features = super().__call__(features)
+-        if self.block_diag_attn and self.attn_implementation != "flash_attention_2":
++        if self.conversational_reasoning_attn and self.attn_implementation == "flash_attention_2":
++            raise ValueError("Flash attention 2 is not supported with conversational reasoning.")
++        if self.conversational_reasoning_attn:
++            features["attention_mask"] = prepare_conversational_reasoning_4d_attention_mask(features["attention_mask"], self.compute_dtype, features.get("indices", None))
++        elif self.block_diag_attn and self.attn_implementation != "flash_attention_2":
+             features["attention_mask"] = prepare_4d_attention_mask(features["attention_mask"], self.compute_dtype)
+ 
+         for key, value in features.items():  # cast data dtype for paligemma
+diff --git a/src/llamafactory/data/loader.py b/src/llamafactory/data/loader.py
+index 645794c1..9ec3b654 100644
+--- a/src/llamafactory/data/loader.py
++++ b/src/llamafactory/data/loader.py
+@@ -27,6 +27,8 @@ from .parser import get_dataset_list
+ from .processor import (
+     FeedbackDatasetProcessor,
+     PackedSupervisedDatasetProcessor,
++    ConversationalReasoningSupervisedDatasetProcessor,
++    PackedConversationalReasoningSupervisedDatasetProcessor,
+     PairwiseDatasetProcessor,
+     PretrainDatasetProcessor,
+     SupervisedDatasetProcessor,
+@@ -213,7 +215,14 @@ def _get_dataset_processor(
+                     )
+ 
+                 OptimizedTypedSequence.__init__ = __init__
+-            dataset_processor_class = PackedSupervisedDatasetProcessor
++            if data_args.special_mask_for_reasoning:
++                if not data_args.neat_packing:
++                    raise ValueError("`neat_packing` must be True when `special_mask_for_reasoning` and `packing` are True.")
++                dataset_processor_class = PackedConversationalReasoningSupervisedDatasetProcessor
++            else:
++                dataset_processor_class = PackedSupervisedDatasetProcessor
++        elif data_args.special_mask_for_reasoning:
++            dataset_processor_class = ConversationalReasoningSupervisedDatasetProcessor
+         else:
+             dataset_processor_class = SupervisedDatasetProcessor
+ 
+diff --git a/src/llamafactory/data/processor/__init__.py b/src/llamafactory/data/processor/__init__.py
+index 357ab789..547f6bd4 100644
+--- a/src/llamafactory/data/processor/__init__.py
++++ b/src/llamafactory/data/processor/__init__.py
+@@ -16,7 +16,7 @@ from .feedback import FeedbackDatasetProcessor
+ from .pairwise import PairwiseDatasetProcessor
+ from .pretrain import PretrainDatasetProcessor
+ from .processor_utils import DatasetProcessor
+-from .supervised import PackedSupervisedDatasetProcessor, SupervisedDatasetProcessor
++from .supervised import PackedSupervisedDatasetProcessor, SupervisedDatasetProcessor, ConversationalReasoningSupervisedDatasetProcessor, PackedConversationalReasoningSupervisedDatasetProcessor
+ from .unsupervised import UnsupervisedDatasetProcessor
+ 
+ 
+@@ -28,4 +28,6 @@ __all__ = [
+     "PretrainDatasetProcessor",
+     "SupervisedDatasetProcessor",
+     "UnsupervisedDatasetProcessor",
++    "ConversationalReasoningSupervisedDatasetProcessor",
++    "PackedConversationalReasoningSupervisedDatasetProcessor",
+ ]
+diff --git a/src/llamafactory/data/processor/supervised.py b/src/llamafactory/data/processor/supervised.py
+index 26e50d93..ca4e6d6e 100644
+--- a/src/llamafactory/data/processor/supervised.py
++++ b/src/llamafactory/data/processor/supervised.py
+@@ -201,3 +201,201 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
+             model_inputs["audios"].append(packed_audios or None)
+ 
+         return model_inputs
++
++
++@dataclass
++class ConversationalReasoningSupervisedDatasetProcessor(SupervisedDatasetProcessor):
++    def _encode_data_example(
++        self,
++        prompt: list[dict[str, str]],
++        response: list[dict[str, str]],
++        system: Optional[str],
++        tools: Optional[str],
++        images: list["ImageInput"],
++        videos: list["VideoInput"],
++        audios: list["AudioInput"],
++    ):
++        messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
++        input_ids, labels = self.template.mm_plugin.process_token_ids(
++            [], [], images, videos, audios, self.tokenizer, self.processor
++        )
++        encoded_triples = self.template.encode_multiturn_reasoning(self.tokenizer, messages, system, tools)
++
++        if self.data_args.mask_history:
++            raise ValueError("Mask history is not supported with conversational reasoning.")
++
++        if self.data_args.train_on_prompt:
++            raise ValueError("Train on prompt is not supported with conversational reasoning.")
++
++        if self.template.efficient_eos:
++            raise ValueError("Efficient eos templates are not supported with conversational reasoning.")
++
++
++        attention_mask, position_ids = [], []
++        total_length, curr_pos_id = 0, 0
++        for turn_idx, (source_ids, reasoning_ids, assistant_ids) in enumerate(encoded_triples):
++            duplicate = len(reasoning_ids) != 0
++
++            turn_length = len(source_ids) + len(reasoning_ids) + len(assistant_ids)
++
++            if duplicate:
++                turn_length += len(assistant_ids)
++
++            if total_length + turn_length > self.data_args.cutoff_len:
++                # TODO: handle this later!
++                raise ValueError(f"Example exceeds cutoff length: {total_length + turn_length} > {self.data_args.cutoff_len}")
++
++            total_length += turn_length
++
++            # Handle labels for source part
++            source_label = [IGNORE_INDEX] * len(source_ids)
++            source_positions = list(range(curr_pos_id, curr_pos_id + len(source_ids)))  # appears on the start of the sequence
++            curr_pos_id += len(source_ids) # update current position for further tokens (reasoning, input assistant, output assistant appear after source)
++
++            # Handle labels for reasoning part - always train on reasoning
++            reasoning_label = reasoning_ids.copy()
++            reasoning_positions = list(range(curr_pos_id, curr_pos_id + len(reasoning_ids)))  # appears immediately after source
++
++            # Handle labels for input assistant tokens.
++            input_assistant_label = [IGNORE_INDEX] * len(assistant_ids)
++            input_assistant_positions = list(range(curr_pos_id, curr_pos_id + len(input_assistant_label))) # appears immediately after source and not reasoning
++
++            # Handle labels for output assistant tokens.
++            ouput_assistant_label = assistant_ids.copy()
++            output_assistant_positions = list(range(curr_pos_id + len(reasoning_ids), curr_pos_id + len(reasoning_ids) + len(ouput_assistant_label))) # appears after reasoning.
++
++            curr_pos_id += len(assistant_ids) # next source is after assistant.
++
++            input_ids += source_ids + reasoning_ids + assistant_ids
++            labels += source_label + reasoning_label + input_assistant_label
++            position_ids += source_positions + reasoning_positions + input_assistant_positions
++            attention_mask += [1] * len(source_ids) + [2] * len(reasoning_ids) + [3] * len(assistant_ids)
++            if duplicate:
++                input_ids += assistant_ids.copy()
++                labels += ouput_assistant_label
++                position_ids += output_assistant_positions
++                attention_mask += [4] * len(assistant_ids)
++
++        # TODO: check if we can just ignore padding!
++        # In +ve case we can remove the below code.
++        if total_length < self.data_args.cutoff_len:
++            pad_length = self.data_args.cutoff_len - total_length
++            input_ids += [self.tokenizer.pad_token_id] * pad_length
++            labels += [IGNORE_INDEX] * pad_length
++            position_ids += [0] * pad_length
++            attention_mask += [0] * pad_length
++
++        assert len(input_ids) == len(labels) == len(attention_mask) == len(position_ids) == self.data_args.cutoff_len
++        return input_ids, labels, attention_mask, position_ids, total_length
++
++    def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
++        """TODO: document this!"""
++        model_inputs = defaultdict(list)
++        for i in range(len(examples["_prompt"])):
++            if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
++                logger.warning_rank0(
++                    "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
++                )
++                continue
++
++            input_ids, labels, attention_mask, position_ids, _ = self._encode_data_example(
++                prompt=examples["_prompt"][i],
++                response=examples["_response"][i],
++                system=examples["_system"][i],
++                tools=examples["_tools"][i],
++                images=examples["_images"][i] or [],
++                videos=examples["_videos"][i] or [],
++                audios=examples["_audios"][i] or [],
++            )
++            model_inputs["input_ids"].append(input_ids)
++            model_inputs["attention_mask"].append(attention_mask)
++            model_inputs["position_ids"].append(position_ids)
++            model_inputs["labels"].append(labels)
++            model_inputs["images"].append(examples["_images"][i])
++            model_inputs["videos"].append(examples["_videos"][i])
++            model_inputs["audios"].append(examples["_audios"][i])
++
++        return model_inputs
++
++@dataclass
++class PackedConversationalReasoningSupervisedDatasetProcessor(ConversationalReasoningSupervisedDatasetProcessor):
++    def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
++        # TODO: use `position_ids` to achieve packing
++        # build inputs with format `<bos> X1 Y1 <eos> <bos> X2 Y2 <eos>`
++        # and labels with format `<ignore> ... <ignore> Y1 <eos> <ignore> ... <ignore> Y2 <eos>`
++        if not self.data_args.neat_packing:
++            raise ValueError("Use neat packing it's far superior.")
++
++        valid_num = 0
++        batch_input_ids, batch_labels, batch_images, batch_videos, batch_audios, batch_attention_mask, batch_position_ids = [], [], [], [], [], [], []
++        lengths = []
++        length2indexes = defaultdict(list)
++        for i in range(len(examples["_prompt"])):
++            if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
++                logger.warning_rank0(
++                    "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
++                )
++                continue
++
++            input_ids, labels, attention_mask, position_ids, length = self._encode_data_example(
++                prompt=examples["_prompt"][i],
++                response=examples["_response"][i],
++                system=examples["_system"][i],
++                tools=examples["_tools"][i],
++                images=examples["_images"][i] or [],
++                videos=examples["_videos"][i] or [],
++                audios=examples["_audios"][i] or [],
++            )
++            # trim samples to sample length, aka remove padding.
++            input_ids, labels, attention_mask, position_ids = input_ids[:length], labels[:length], attention_mask[:length], position_ids[:length]
++            if length > self.data_args.cutoff_len:
++                logger.warning_rank0(f"Dropped lengthy example with length {length} > {self.data_args.cutoff_len}.")
++            else:
++                lengths.append(length)
++                length2indexes[length].append(valid_num)
++                batch_input_ids.append(input_ids)
++                batch_labels.append(labels)
++                batch_images.append(examples["_images"][i] or [])
++                batch_videos.append(examples["_videos"][i] or [])
++                batch_audios.append(examples["_audios"][i] or [])
++                batch_attention_mask.append(attention_mask)
++                batch_position_ids.append(position_ids)
++                valid_num += 1
++
++        model_inputs = defaultdict(list)
++        knapsacks = greedy_knapsack(lengths, self.data_args.cutoff_len)
++        for knapsack in knapsacks:
++            packed_input_ids, packed_attention_masks, packed_position_ids, packed_labels, packed_indices = [], [], [], [], []
++            packed_images, packed_videos, packed_audios = [], [], []
++            for i, length in enumerate(knapsack):
++                index = length2indexes[length].pop()
++                packed_input_ids += batch_input_ids[index]
++                packed_position_ids += batch_position_ids[index]
++                packed_labels += batch_labels[index]
++                packed_images += batch_images[index]
++                packed_videos += batch_videos[index]
++                packed_audios += batch_audios[index]
++                packed_attention_masks += batch_attention_mask[index]
++                packed_indices += [i + 1] * len(batch_input_ids[index])  # start from 1
++
++            if len(packed_input_ids) < self.data_args.cutoff_len + 1:  # avoid flash_attn drops attn mask
++                pad_length = self.data_args.cutoff_len - len(packed_input_ids) + 1
++                packed_input_ids += [self.tokenizer.pad_token_id] * pad_length
++                packed_position_ids += [0] * pad_length
++                packed_labels += [IGNORE_INDEX] * pad_length
++                packed_attention_masks += [0] * pad_length
++                packed_indices += [0] * pad_length
++
++            if len(packed_input_ids) != self.data_args.cutoff_len + 1:
++                raise ValueError("The length of packed example should be identical to the cutoff length.")
++
++            model_inputs["input_ids"].append(packed_input_ids)
++            model_inputs["attention_mask"].append(packed_attention_masks)
++            model_inputs["position_ids"].append(packed_position_ids)
++            model_inputs["labels"].append(packed_labels)
++            model_inputs["indices"].append(packed_indices)
++            model_inputs["images"].append(packed_images or None)
++            model_inputs["videos"].append(packed_videos or None)
++            model_inputs["audios"].append(packed_audios or None)
++
++        return model_inputs
+diff --git a/src/llamafactory/data/template.py b/src/llamafactory/data/template.py
+index 74faea46..946cef09 100644
+--- a/src/llamafactory/data/template.py
++++ b/src/llamafactory/data/template.py
+@@ -82,6 +82,17 @@ class Template:
+         encoded_messages = self._encode(tokenizer, messages, system, tools)
+         return [(encoded_messages[i], encoded_messages[i + 1]) for i in range(0, len(encoded_messages), 2)]
+ 
++    def encode_multiturn_reasoning(
++        self,
++        tokenizer: "PreTrainedTokenizer",
++        messages: list[dict[str, str]],
++        system: Optional[str] = None,
++        tools: Optional[str] = None,
++    ) -> list[tuple[list[int], list[int], list[int]]]:
++        r"""Returns multiple pairs of token ids representing prompts, thoughts and responses respectively."""
++        encoded_messages = self._encode(tokenizer, messages, system, tools, separate_thoughts=True)
++        return [(encoded_messages[i], encoded_messages[i + 1], encoded_messages[i + 2]) for i in range(0, len(encoded_messages), 3)]
++
+     def extract_tool(self, content: str) -> Union[str, list["FunctionCall"]]:
+         r"""Extract tool message."""
+         return self.format_tools.extract(content)
+@@ -132,12 +143,40 @@ class Template:
+         messages: list[dict[str, str]],
+         system: Optional[str],
+         tools: Optional[str],
++        separate_thoughts: bool = False,
+     ) -> list[list[int]]:
+         r"""Encode formatted inputs to pairs of token ids.
+ 
+         Turn 0: prefix + system + query        resp
+         Turn t: query                          resp.
++
++        When separate_thoughts is True:
++        Turn 0: prefix + system + query        thought  resp
++        Turn t: query                          thought  resp.
+         """
++        def seperate_thought_slots(slots: "SLOTS") -> tuple["SLOTS", "SLOTS"]:
++            # TODO: improve and generalize this method for all data types.
++            if not isinstance(slots, list):
++                raise ValueError(f"Unexpected slots type: {type(slots)}")
++
++            # for now we only handle for string slots.
++            if len(slots) != 1:
++                raise ValueError(f"Unexpected slots length: {len(slots)}")
++
++            if not isinstance(slots[0], str):
++                raise ValueError(f"Unexpected slot type: {type(slots[0])}")
++
++            slot = slots[0]
++            regex = re.compile(r"{}(.*?){}".format(re.escape(self.thought_words[0]), re.escape(self.thought_words[1])), re.DOTALL)
++            thought = re.search(regex, slot)
++            if thought:
++                assistant = slot.replace(thought.group(0), "")
++                assistant_stripped = assistant.lstrip()
++                diff = len(assistant) - len(assistant_stripped)
++                return [thought.group(0) + assistant[:diff]], [assistant_stripped]
++            else:
++                return [], slots
++
+         system = system or self.default_system
+         encoded_messages = []
+         for i, message in enumerate(messages):
+@@ -151,12 +190,21 @@ class Template:
+ 
+             if message["role"] == Role.USER:
+                 elements += self.format_user.apply(content=message["content"], idx=str(i // 2))
+-            elif message["role"] == Role.ASSISTANT:
+-                elements += self.format_assistant.apply(content=message["content"])
+             elif message["role"] == Role.OBSERVATION:
+                 elements += self.format_observation.apply(content=message["content"])
+             elif message["role"] == Role.FUNCTION:
+                 elements += self.format_function.apply(content=message["content"])
++            elif message["role"] == Role.ASSISTANT:
++                assistant_slots = self.format_assistant.apply(content=message["content"])
++                if separate_thoughts:
++                    # TODO: what about i==0 and separate_thoughts is True? are system and tools are applicable in that case?
++                    # can we even enter assistant role incase of i==0?
++                    thought_slots, assistant_slots = seperate_thought_slots(assistant_slots)
++                    elements += thought_slots
++                    encoded_messages.append(self._convert_elements_to_ids(tokenizer, elements))
++                    elements = assistant_slots
++                else:
++                    elements += assistant_slots
+             else:
+                 raise NotImplementedError("Unexpected role: {}".format(message["role"]))
+ 
+diff --git a/src/llamafactory/extras/constants.py b/src/llamafactory/extras/constants.py
+index 5dc7c3f3..a0f7462f 100644
+--- a/src/llamafactory/extras/constants.py
++++ b/src/llamafactory/extras/constants.py
+@@ -101,6 +101,7 @@ class AttentionFunction(str, Enum):
+     DISABLED = "disabled"
+     SDPA = "sdpa"
+     FA2 = "fa2"
++    FLEX = "flex"
+ 
+ 
+ class EngineName(str, Enum):
+diff --git a/src/llamafactory/hparams/data_args.py b/src/llamafactory/hparams/data_args.py
+index c84fb2f7..0c12b3b7 100644
+--- a/src/llamafactory/hparams/data_args.py
++++ b/src/llamafactory/hparams/data_args.py
+@@ -111,6 +111,10 @@ class DataArguments:
+         default=False,
+         metadata={"help": "Enable sequence packing without cross-attention."},
+     )
++    special_mask_for_reasoning: Optional[bool] = field(
++        default=None,
++        metadata={"help": "Whether to create a specialized attention mask for conversational reasoning tasks."},
++    )
+     tool_format: Optional[str] = field(
+         default=None,
+         metadata={"help": "Tool format to use for constructing function calling examples."},
+@@ -178,5 +182,11 @@ class DataArguments:
+         if self.packing:
+             self.cutoff_len -= 1  # avoid pad_to_multiple_of, needs improve
+ 
++        if self.special_mask_for_reasoning:
++            if self.mask_history:
++                raise ValueError("`special_mask_for_reasoning` is incompatible with `mask_history`.")
++            if self.packing and not self.neat_packing:
++                raise ValueError("`special_mask_for_reasoning` is currently only supported with `neat_packing`.")
++
+     def to_dict(self) -> dict[str, Any]:
+         return asdict(self)
+diff --git a/src/llamafactory/hparams/parser.py b/src/llamafactory/hparams/parser.py
+index 7b0c0476..ed70b3e2 100644
+--- a/src/llamafactory/hparams/parser.py
++++ b/src/llamafactory/hparams/parser.py
+@@ -214,6 +214,9 @@ def get_train_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _
+         if data_args.neat_packing:
+             raise ValueError("`neat_packing` cannot be set as True except SFT.")
+ 
++        if data_args.special_mask_for_reasoning:
++            raise ValueError("`special_mask_for_reasoning` cannot be set as True except SFT.")
++
+         if data_args.train_on_prompt or data_args.mask_history:
+             raise ValueError("`train_on_prompt` or `mask_history` cannot be set as True except SFT.")
+ 
+diff --git a/src/llamafactory/model/model_utils/attention.py b/src/llamafactory/model/model_utils/attention.py
+index fb86a163..3b03134b 100644
+--- a/src/llamafactory/model/model_utils/attention.py
++++ b/src/llamafactory/model/model_utils/attention.py
+@@ -62,6 +62,15 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
+             return
+ 
+         requested_attn_implementation = "flash_attention_2"
++    elif model_args.flash_attn == AttentionFunction.FLEX:
++        # FlexAttention (PyTorch >= 2.5) with support for custom masks via BlockMask.
++        try:
++            import torch.nn.attention.flex_attention  # noqa: F401
++        except Exception:
++            logger.warning_rank0("FlexAttention is not available. Please upgrade to PyTorch >= 2.5 and ensure it is built with CUDA support.")
++            return
++
++        requested_attn_implementation = "flex_attention"
+     else:
+         raise NotImplementedError(f"Unknown attention type: {model_args.flash_attn}")
+ 
+@@ -84,5 +93,7 @@ def print_attn_implementation(config: "PretrainedConfig") -> None:
+         logger.info_rank0("Using FlashAttention-2 for faster training and inference.")
+     elif attn_implementation == "sdpa":
+         logger.info_rank0("Using torch SDPA for faster training and inference.")
++    elif attn_implementation == "flex_attention":
++        logger.info_rank0("Using FlexAttention for flexible, high-performance attention with custom mask support.")
+     else:
+         logger.info_rank0("Using vanilla attention implementation.")
+diff --git a/src/llamafactory/train/sft/workflow.py b/src/llamafactory/train/sft/workflow.py
+index aab1cb13..c2a3c5ae 100644
+--- a/src/llamafactory/train/sft/workflow.py
++++ b/src/llamafactory/train/sft/workflow.py
+@@ -62,6 +62,7 @@ def run_sft(
+         block_diag_attn=model_args.block_diag_attn,
+         attn_implementation=getattr(model.config, "_attn_implementation", None),
+         compute_dtype=model_args.compute_dtype,
++        conversational_reasoning_attn=data_args.special_mask_for_reasoning,
+         **tokenizer_module,
+     )
+ 
+diff --git a/src/llamafactory/webui/chatter.py b/src/llamafactory/webui/chatter.py
+index 9b1bcd67..b3a0b195 100644
+--- a/src/llamafactory/webui/chatter.py
++++ b/src/llamafactory/webui/chatter.py
+@@ -120,13 +120,20 @@ class WebChatModel(ChatModel):
+             return
+ 
+         yield ALERTS["info_loading"][lang]
++        booster = get("top.booster")
++        if booster == "flashattn2":
++            flash_attn = "fa2"
++        elif booster == "flex":
++            flash_attn = "flex"
++        else:
++            flash_attn = "auto"
+         args = dict(
+             model_name_or_path=model_path,
+             cache_dir=user_config.get("cache_dir", None),
+             finetuning_type=finetuning_type,
+             template=get("top.template"),
+             rope_scaling=get("top.rope_scaling") if get("top.rope_scaling") != "none" else None,
+-            flash_attn="fa2" if get("top.booster") == "flashattn2" else "auto",
++            flash_attn=flash_attn,
+             use_unsloth=(get("top.booster") == "unsloth"),
+             enable_liger_kernel=(get("top.booster") == "liger_kernel"),
+             infer_backend=get("infer.infer_backend"),
+diff --git a/src/llamafactory/webui/components/top.py b/src/llamafactory/webui/components/top.py
+index 7d17e079..332ac281 100644
+--- a/src/llamafactory/webui/components/top.py
++++ b/src/llamafactory/webui/components/top.py
+@@ -45,7 +45,7 @@ def create_top() -> dict[str, "Component"]:
+         quantization_method = gr.Dropdown(choices=["bnb", "hqq", "eetq"], value="bnb")
+         template = gr.Dropdown(choices=list(TEMPLATES.keys()), value="default")
+         rope_scaling = gr.Dropdown(choices=["none", "linear", "dynamic", "yarn", "llama3"], value="none")
+-        booster = gr.Dropdown(choices=["auto", "flashattn2", "unsloth", "liger_kernel"], value="auto")
++        booster = gr.Dropdown(choices=["auto", "flashattn2", "unsloth", "liger_kernel", "flex"], value="auto")
+ 
+     model_name.change(get_model_info, [model_name], [model_path, template], queue=False).then(
+         list_checkpoints, [model_name, finetuning_type], [checkpoint_path], queue=False
+diff --git a/src/llamafactory/webui/components/train.py b/src/llamafactory/webui/components/train.py
+index 8b7aa6e9..8000918d 100644
+--- a/src/llamafactory/webui/components/train.py
++++ b/src/llamafactory/webui/components/train.py
+@@ -101,6 +101,9 @@ def create_train_tab(engine: "Engine") -> dict[str, "Component"]:
+                 train_on_prompt = gr.Checkbox()
+                 mask_history = gr.Checkbox()
+ 
++            with gr.Column():
++                special_mask_for_reasoning = gr.Checkbox()
++
+             with gr.Column():
+                 resize_vocab = gr.Checkbox()
+                 use_llama_pro = gr.Checkbox()
+@@ -128,6 +131,7 @@ def create_train_tab(engine: "Engine") -> dict[str, "Component"]:
+             use_llama_pro,
+             enable_thinking,
+             report_to,
++            special_mask_for_reasoning,
+         }
+     )
+     elem_dict.update(
+@@ -146,6 +150,7 @@ def create_train_tab(engine: "Engine") -> dict[str, "Component"]:
+             use_llama_pro=use_llama_pro,
+             enable_thinking=enable_thinking,
+             report_to=report_to,
++            special_mask_for_reasoning=special_mask_for_reasoning,
+         )
+     )
+ 
+diff --git a/src/llamafactory/webui/locales.py b/src/llamafactory/webui/locales.py
+index 17ffb0a4..06129ddc 100644
+--- a/src/llamafactory/webui/locales.py
++++ b/src/llamafactory/webui/locales.py
+@@ -783,6 +783,28 @@ LOCALES = {
+             "info": "パッキング後のシーケンス間のクロスアテンションを避けます。",
+         },
+     },
++    "special_mask_for_reasoning": {
++        "en": {
++            "label": "Special mask for reasoning",
++            "info": "Create a specialized attention mask for conversational reasoning tasks.",
++        },
++        "ru": {
++            "label": "Специальная маска для рассуждений",
++            "info": "Создать специальную маску для задач рассуждения в диалоге.",
++        },
++        "zh": {
++            "label": "特殊推理掩码",
++            "info": "为对话推理任务创建一个专门的注意力掩码。",
++        },
++        "ko": {
++            "label": "특수 마스크 추론",
++            "info": "대화 추론 작업에 대한 특수 주의 마스크를 만듭니다.",
++        },
++        "ja": {
++            "label": "特殊推理マスク",
++            "info": "会話推理タスクに特化した注意マスクを作成します。",
++        },
++    },
+     "train_on_prompt": {
+         "en": {
+             "label": "Train on prompt",
+diff --git a/src/llamafactory/webui/runner.py b/src/llamafactory/webui/runner.py
+index 3715974a..b8c5266a 100644
+--- a/src/llamafactory/webui/runner.py
++++ b/src/llamafactory/webui/runner.py
+@@ -131,6 +131,13 @@ class Runner:
+         model_name, finetuning_type = get("top.model_name"), get("top.finetuning_type")
+         user_config = load_config()
+ 
++        booster = get("top.booster")
++        if booster == "flashattn2":
++            flash_attn = "fa2"
++        elif booster == "flex":
++            flash_attn = "flex"
++        else:
++            flash_attn = "auto"
+         args = dict(
+             stage=TRAINING_STAGES[get("train.training_stage")],
+             do_train=True,
+@@ -140,7 +147,7 @@ class Runner:
+             finetuning_type=finetuning_type,
+             template=get("top.template"),
+             rope_scaling=get("top.rope_scaling") if get("top.rope_scaling") != "none" else None,
+-            flash_attn="fa2" if get("top.booster") == "flashattn2" else "auto",
++            flash_attn=flash_attn,
+             use_unsloth=(get("top.booster") == "unsloth"),
+             enable_liger_kernel=(get("top.booster") == "liger_kernel"),
+             dataset_dir=get("train.dataset_dir"),
+@@ -159,6 +166,7 @@ class Runner:
+             neftune_noise_alpha=get("train.neftune_alpha") or None,
+             packing=get("train.packing") or get("train.neat_packing"),
+             neat_packing=get("train.neat_packing"),
++            special_mask_for_reasoning=get("train.special_mask_for_reasoning"),
+             train_on_prompt=get("train.train_on_prompt"),
+             mask_history=get("train.mask_history"),
+             resize_vocab=get("train.resize_vocab"),
+@@ -294,6 +302,14 @@ class Runner:
+         model_name, finetuning_type = get("top.model_name"), get("top.finetuning_type")
+         user_config = load_config()
+ 
++        booster = get("top.booster")
++        if booster == "flashattn2":
++            flash_attn = "fa2"
++        elif booster == "flex":
++            flash_attn = "flex"
++        else:
++            flash_attn = "auto"
++
+         args = dict(
+             stage="sft",
+             model_name_or_path=get("top.model_path"),
+@@ -303,7 +319,7 @@ class Runner:
+             quantization_method=get("top.quantization_method"),
+             template=get("top.template"),
+             rope_scaling=get("top.rope_scaling") if get("top.rope_scaling") != "none" else None,
+-            flash_attn="fa2" if get("top.booster") == "flashattn2" else "auto",
++            flash_attn=flash_attn,
+             use_unsloth=(get("top.booster") == "unsloth"),
+             dataset_dir=get("eval.dataset_dir"),
+             eval_dataset=",".join(get("eval.dataset")),

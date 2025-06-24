@@ -1,0 +1,5 @@
+Conversation:
+{conversation}
+
+Latest assistant message:
+{latest_assistant_message}
